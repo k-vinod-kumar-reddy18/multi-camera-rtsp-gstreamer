@@ -1,0 +1,9 @@
+paths:
+  camera1:
+    source: publisher
+
+  camera2:
+    source: publisher
+
+  camera3:
+    source: publisher
