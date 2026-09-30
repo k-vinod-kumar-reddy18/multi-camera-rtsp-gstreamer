@@ -5,5 +5,4 @@ paths:
   camera2:
     source: publisher
 
-  camera3:
-    source: publisher
+

@@ -1,6 +1,7 @@
 import os
-import signal
+import socket
 import subprocess
+import sys
 import time
 
 
@@ -8,7 +9,7 @@ import time
 # PROJECT PATHS
 # ============================================================
 
-PROJECT_DIR = r"C:\Users\VinodKumarReddy\Downloads\multi_camera_rtsp_gstreamer"
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MEDIAMTX_EXE = (
     r"C:\Users\VinodKumarReddy\Downloads"
@@ -61,16 +62,12 @@ CAMERAS = [
     {
         "name": "camera2",
         "video": "cam2_trim 1.mp4"
-    },
-    {
-        "name": "camera3",
-        "video": "cam3_trim.mp4"
     }
 ]
 
 
 # ============================================================
-# CHECK PROGRAMS AND FILES
+# CHECK REQUIREMENTS
 # ============================================================
 
 def check_requirements():
@@ -91,6 +88,7 @@ def check_requirements():
 
         if os.path.exists(path):
             print(f"[OK] {name}")
+
         else:
             print(f"[ERROR] {name} not found:")
             print(path)
@@ -137,6 +135,12 @@ def start_mediamtx():
     print("=" * 60)
     print("STARTING MEDIAMTX")
     print("=" * 60)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        if listener.connect_ex(("127.0.0.1", 8554)) == 0:
+            raise RuntimeError(
+                "RTSP port 8554 is already in use; refusing to start a second MediaMTX process."
+            )
 
     process = subprocess.Popen(
         [
@@ -188,21 +192,27 @@ def start_ffmpeg(camera):
         [
             FFMPEG_EXE,
 
-            # Real-time playback
+            # Keep the required stream mapping visible without per-frame console traffic.
+            "-nostats",
+
+            # Play video in real time
             "-re",
 
-            # Input video
+            # Input
             "-i",
             video_path,
 
-            # Copy H264 without re-encoding
+            # IMPORTANT:
+            # Copy existing H.264.
+            # No decode.
+            # No re-encode.
             "-c:v",
             "copy",
 
             # No audio
             "-an",
 
-            # RTSP output
+            # RTSP
             "-f",
             "rtsp",
 
@@ -210,7 +220,7 @@ def start_ffmpeg(camera):
             "-rtsp_transport",
             "tcp",
 
-            # RTSP URL
+            # URL
             rtsp_url
         ],
         cwd=PROJECT_DIR
@@ -222,6 +232,46 @@ def start_ffmpeg(camera):
     )
 
     return process
+
+
+def wait_for_rtsp_stream(camera, publisher_process, timeout=20):
+
+    name = camera["name"]
+    deadline = time.monotonic() + timeout
+    request = (
+        f"DESCRIBE rtsp://127.0.0.1:8554/{name} RTSP/1.0\r\n"
+        "CSeq: 1\r\n"
+        "Accept: application/sdp\r\n\r\n"
+    ).encode("ascii")
+
+    while time.monotonic() < deadline:
+
+        if publisher_process.poll() is not None:
+            raise RuntimeError(
+                f"FFmpeg for {name} exited before its RTSP stream became available."
+            )
+
+        try:
+            with socket.create_connection(
+                ("127.0.0.1", 8554),
+                timeout=1
+            ) as connection:
+                connection.settimeout(1)
+                connection.sendall(request)
+                response = connection.recv(1024)
+
+            if response.startswith(b"RTSP/1.0 200"):
+                print(f"RTSP stream available: rtsp://localhost:8554/{name}")
+                return
+
+        except OSError:
+            pass
+
+        time.sleep(0.2)
+
+    raise TimeoutError(
+        f"Timed out waiting for rtsp://localhost:8554/{name}."
+    )
 
 
 # ============================================================
@@ -240,9 +290,11 @@ def start_gstreamer(camera):
         camera["video"]
     )[0]
 
-    output_file = os.path.join(
-        RESULTS_DIR,
-        f"{video_name}_rtsp_output.mp4"
+    output_file = os.path.abspath(
+        os.path.join(
+            RESULTS_DIR,
+            f"{video_name}_rtsp_output.mp4"
+        )
     )
 
     # Remove old output
@@ -250,45 +302,82 @@ def start_gstreamer(camera):
 
         try:
             os.remove(output_file)
-        except Exception:
-            pass
+
+        except Exception as error:
+
+            print(
+                f"Could not remove old file: "
+                f"{error}"
+            )
 
     print(
         f"Starting GStreamer for {name}..."
     )
 
+    # ========================================================
+    # IMPORTANT PIPELINE
+    #
+    # RTSP
+    #   ↓
+    # RTP H264 depay
+    #   ↓
+    # H264 parser
+    #   ↓
+    # MP4 split muxer
+    #   ↓
+    # MP4 file
+    #
+    # H.264 remains compressed end to end.
+    # ========================================================
+
+    pipeline = [
+        GSTREAMER_EXE,
+
+        "-e",
+
+        # RTSP source
+        "rtspsrc",
+        f"location={rtsp_url}",
+        "protocols=tcp",
+        "latency=200",
+
+        "!",
+
+        # RTP -> H264
+        "rtph264depay",
+
+        "!",
+
+        # Parse H264
+        "h264parse",
+        "config-interval=-1",
+
+        "!",
+
+        # mp4mux requires AVC-format access units. Keep the stream
+        # compressed and make the muxer's input contract explicit.
+        "video/x-h264,stream-format=avc,alignment=au",
+
+        "!",
+
+        # Write and finalize one MP4 when the RTSP stream reaches EOS.
+        "mp4mux",
+
+        "!",
+
+        "filesink",
+        f'location="{output_file.replace(os.sep, "/")}"'
+    ]
+
+    print()
+    print(
+        f"GStreamer output:"
+    )
+    print(output_file)
+    print()
+
     process = subprocess.Popen(
-        [
-            GSTREAMER_EXE,
-
-            "-e",
-
-            "rtspsrc",
-
-            f"location={rtsp_url}",
-
-            "protocols=tcp",
-
-            "latency=200",
-
-            "!",
-
-            "rtph264depay",
-
-            "!",
-
-            "h264parse",
-
-            "!",
-
-            "mp4mux",
-
-            "!",
-
-            "filesink",
-
-            f"location={output_file}"
-        ],
+        pipeline,
         cwd=PROJECT_DIR
     )
 
@@ -301,7 +390,7 @@ def start_gstreamer(camera):
 
 
 # ============================================================
-# STOP PROCESS SAFELY
+# STOP PROCESS
 # ============================================================
 
 def stop_process(process, name):
@@ -330,8 +419,13 @@ def stop_process(process, name):
             )
 
             try:
+
                 process.kill()
-                process.wait(timeout=3)
+
+                process.wait(
+                    timeout=3
+                )
+
             except Exception:
                 pass
 
@@ -356,6 +450,7 @@ def main():
     gst_processes = []
 
     recordings = []
+    exit_code = 1
 
     try:
 
@@ -365,7 +460,7 @@ def main():
         print("=" * 60)
 
         # ----------------------------------------------------
-        # CHECK EVERYTHING
+        # CHECK
         # ----------------------------------------------------
 
         if not check_requirements():
@@ -375,22 +470,25 @@ def main():
                 "Requirement check failed."
             )
 
-            return
+            return exit_code
 
         # ----------------------------------------------------
-        # START MEDIAMTX
+        # MEDIAMTX
         # ----------------------------------------------------
 
         mediamtx_process = start_mediamtx()
 
         # ----------------------------------------------------
-        # START ALL FFMPEG STREAMS
+        # FFMPEG
         # ----------------------------------------------------
 
         print()
         print("=" * 60)
         print("STARTING ALL RTSP STREAMS")
         print("=" * 60)
+
+        print()
+        print("Starting each recorder as soon as its RTSP path is ready...")
 
         for camera in CAMERAS:
 
@@ -405,30 +503,7 @@ def main():
                 )
             )
 
-            # Small delay between publishers
-            time.sleep(1)
-
-        # ----------------------------------------------------
-        # WAIT FOR RTSP STREAMS
-        # ----------------------------------------------------
-
-        print()
-        print(
-            "Waiting for all RTSP streams..."
-        )
-
-        time.sleep(4)
-
-        # ----------------------------------------------------
-        # START ALL GSTREAMER RECORDERS
-        # ----------------------------------------------------
-
-        print()
-        print("=" * 60)
-        print("STARTING ALL GSTREAMER RECORDERS")
-        print("=" * 60)
-
-        for camera in CAMERAS:
+            wait_for_rtsp_stream(camera, process)
 
             gst_process, output_file = (
                 start_gstreamer(camera)
@@ -448,10 +523,11 @@ def main():
                 )
             )
 
-            time.sleep(1)
+            print()
+            print("Both camera publishers and recorders are running.")
 
         # ----------------------------------------------------
-        # SYSTEM RUNNING
+        # RUNNING
         # ----------------------------------------------------
 
         print()
@@ -461,19 +537,15 @@ def main():
 
         for camera in CAMERAS:
 
-            name = camera["name"]
-
-            rtsp_url = (
-                f"rtsp://localhost:8554/{name}"
-            )
-
             print()
             print(
-                f"{name}:"
+                f"{camera['name']}:"
             )
 
             print(
-                f"  RTSP: {rtsp_url}"
+                f"  RTSP: "
+                f"rtsp://localhost:8554/"
+                f"{camera['name']}"
             )
 
         print()
@@ -490,7 +562,7 @@ def main():
         print()
 
         # ----------------------------------------------------
-        # WAIT FOR ALL FFMPEG PROCESSES
+        # WAIT FOR FFMPEG
         # ----------------------------------------------------
 
         for name, process in ffmpeg_processes:
@@ -502,8 +574,13 @@ def main():
                 f"Exit code: {return_code}"
             )
 
+            if return_code != 0:
+                raise RuntimeError(
+                    f"FFmpeg for {name} exited with code {return_code}."
+                )
+
         # ----------------------------------------------------
-        # GIVE GSTREAMER TIME TO RECEIVE EOS
+        # WAIT FOR GSTREAMER EOS
         # ----------------------------------------------------
 
         print()
@@ -512,57 +589,27 @@ def main():
         )
 
         print(
-            "Waiting for GStreamer to finalize "
-            "recordings..."
+            "Waiting for GStreamer to "
+            "finalize MP4 files..."
         )
 
-        time.sleep(3)
-
         # ----------------------------------------------------
-        # STOP GSTREAMER
+        # WAIT GSTREAMER
         # ----------------------------------------------------
 
         for name, process in gst_processes:
 
-            if process.poll() is None:
+            print(f"Waiting for GStreamer {name} EOS...")
+            return_code = process.wait(timeout=30)
+            print(f"GStreamer {name} finished. Exit code: {return_code}")
 
-                print(
-                    f"Stopping GStreamer {name}..."
+            if return_code != 0:
+                raise RuntimeError(
+                    f"GStreamer for {name} exited with code {return_code}."
                 )
 
-                try:
-
-                    process.send_signal(
-                        signal.SIGINT
-                    )
-
-                    process.wait(
-                        timeout=10
-                    )
-
-                except subprocess.TimeoutExpired:
-
-                    print(
-                        f"GStreamer {name} "
-                        f"did not stop normally."
-                    )
-
-                    process.terminate()
-
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-
-                except Exception as error:
-
-                    print(
-                        f"GStreamer {name} "
-                        f"error: {error}"
-                    )
-
         # ----------------------------------------------------
-        # VERIFY RECORDINGS
+        # RESULTS
         # ----------------------------------------------------
 
         print()
@@ -570,9 +617,11 @@ def main():
         print("RECORDING RESULTS")
         print("=" * 60)
 
+        recordings_valid = True
+
         for name, output_file in recordings:
 
-            if os.path.exists(output_file):
+            if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
 
                 size = os.path.getsize(
                     output_file
@@ -594,25 +643,28 @@ def main():
 
             else:
 
+                recordings_valid = False
+
                 print()
                 print(
                     f"[FAILED] {name}"
                 )
 
                 print(
-                    "Output file was not created."
+                    "Output file is missing or empty."
                 )
+
+        if not recordings_valid:
+            raise RuntimeError("One or more MP4 recordings are missing or empty.")
+        exit_code = 0
 
     except KeyboardInterrupt:
 
         print()
-        print("=" * 60)
-        print("CTRL+C DETECTED")
-        print("=" * 60)
-
         print(
-            "Stopping all processes..."
+            "CTRL+C detected."
         )
+        exit_code = 130
 
     except Exception as error:
 
@@ -622,6 +674,7 @@ def main():
         print("=" * 60)
 
         print(error)
+        exit_code = 1
 
     finally:
 
@@ -699,7 +752,9 @@ def main():
 
                     print(
                         f"  {file} "
-                        f"({size / (1024 * 1024):.2f} MB)"
+                        f"("
+                        f"{size / (1024 * 1024):.2f}"
+                        f" MB)"
                     )
 
             else:
@@ -714,6 +769,7 @@ def main():
         )
 
         print("=" * 60)
+    return exit_code
 
 
 # ============================================================
@@ -721,4 +777,4 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,0 +1,5 @@
+05_results/recordings/
+05_results/logs/
+05_results/benchmark/
+__pycache__/
+*.pyc

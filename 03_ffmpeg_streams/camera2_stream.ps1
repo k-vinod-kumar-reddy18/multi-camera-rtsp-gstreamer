@@ -1,3 +1,5 @@
-cd "C:\Users\VinodKumarReddy\Downloads\multi_camera_rtsp_gstreamer"
+$projectRoot = Split-Path -Parent $PSScriptRoot
+$ffmpeg = "C:\Users\VinodKumarReddy\Downloads\ffmpeg-8.1.2-essentials_build\ffmpeg-8.1.2-essentials_build\bin\ffmpeg.exe"
+$inputFile = Join-Path $projectRoot "01_video_sources\cam2_trim 1.mp4"
 
-& "C:\Users\VinodKumarReddy\Downloads\ffmpeg-8.1.2-essentials_build\ffmpeg-8.1.2-essentials_build\bin\ffmpeg.exe" -re -stream_loop -1 -i ".\01_video_sources\cam2_trim 1.mp4" -vf "scale=1280:720" -c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p -r 15 -f rtsp -rtsp_transport tcp "rtsp://localhost:8554/camera2"
+& $ffmpeg -re -i $inputFile -c:v copy -an -f rtsp -rtsp_transport tcp "rtsp://localhost:8554/camera2"
